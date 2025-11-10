@@ -11,6 +11,8 @@ enhance audio streams in real time. It mirrors the structure of other filters li
 the Koala filter and integrates with Pipecat's input transport pipeline.
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import numpy as np
@@ -67,6 +69,7 @@ class AICFilter(BaseAudioFilter):
         self._audio_buffer = bytearray()
         # Model will be created in start() since the API now requires sample_rate
         self._aic = None
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     async def start(self, sample_rate: int):
         """Initialize the filter with the transport's sample rate.
@@ -103,6 +106,8 @@ class AICFilter(BaseAudioFilter):
                 )
 
             self._aic_ready = True
+            # Create a dedicated worker thread for this model instance
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"aic-{id(self)}")
 
             # Log processor information
             logger.debug(f"ai-coustics filter started:")
@@ -131,6 +136,13 @@ class AICFilter(BaseAudioFilter):
             self._aic = None
             self._aic_ready = False
             self._audio_buffer.clear()
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
+
+    def _process_block_sync(self, block_f32: np.ndarray) -> np.ndarray:
+        """Synchronous helper to run the native process call in a worker thread."""
+        return self._aic.process(block_f32)  # type: ignore[union-attr]
 
     async def process_frame(self, frame: FilterControlFrame):
         """Process control frames to enable/disable filtering.
@@ -184,8 +196,11 @@ class AICFilter(BaseAudioFilter):
                 (1, self._frames_per_block)
             )
 
-            # Process planar in-place; returns ndarray (same shape)
-            out_f32 = self._aic.process(block_f32)
+            # Process planar in-place on a worker thread; returns ndarray (same shape)
+            loop = asyncio.get_running_loop()
+            out_f32 = await loop.run_in_executor(
+                self._executor, self._process_block_sync, block_f32
+            )
 
             # Convert back to int16 bytes, planar layout
             out_i16 = np.clip(out_f32 * 32768.0, -32768, 32767).astype(np.int16)
