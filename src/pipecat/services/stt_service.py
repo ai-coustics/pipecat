@@ -9,9 +9,10 @@
 import asyncio
 import io
 import time
+import warnings
 import wave
 from abc import abstractmethod
-from typing import Any, AsyncGenerator, Dict, Mapping, Optional
+from typing import Any, AsyncGenerator, Optional
 
 from loguru import logger
 from websockets.protocol import State
@@ -21,7 +22,6 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterruptionFrame,
-    MetricsFrame,
     ServiceSwitcherRequestMetadataFrame,
     StartFrame,
     STTMetadataFrame,
@@ -31,9 +31,9 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
-from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
+from pipecat.services.settings import STTSettings, is_given
 from pipecat.services.stt_latency import DEFAULT_TTFS_P99
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
@@ -75,6 +75,8 @@ class STTService(AIService):
             logger.error(f"STT connection error: {error}")
     """
 
+    _settings: STTSettings
+
     def __init__(
         self,
         *,
@@ -84,6 +86,7 @@ class STTService(AIService):
         ttfs_p99_latency: Optional[float] = None,
         keepalive_timeout: Optional[float] = None,
         keepalive_interval: float = 5.0,
+        settings: Optional[STTSettings] = None,
         **kwargs,
     ):
         """Initialize the STT service.
@@ -107,13 +110,20 @@ class STTService(AIService):
                 connection alive. None disables keepalive. Useful for services that
                 close idle connections (e.g. behind a ServiceSwitcher).
             keepalive_interval: Seconds between idle checks when keepalive is enabled.
+            settings: The runtime-updatable settings for the STT service.
             **kwargs: Additional arguments passed to the parent AIService.
         """
-        super().__init__(**kwargs)
+        super().__init__(
+            settings=settings
+            # Here in case subclass doesn't implement more specific settings
+            # (which hopefully should be rare)
+            or STTSettings(),
+            **kwargs,
+        )
         self._audio_passthrough = audio_passthrough
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
-        self._settings: Dict[str, Any] = {}
+
         self._muted: bool = False
         self._user_id: str = ""
         self._ttfs_p99_latency = ttfs_p99_latency
@@ -121,11 +131,10 @@ class STTService(AIService):
         # STT TTFB tracking state
         self._stt_ttfb_timeout = stt_ttfb_timeout
         self._ttfb_timeout_task: Optional[asyncio.Task] = None
-        self._speech_end_time: Optional[float] = None
         self._user_speaking: bool = False
-        self._last_transcription_time: Optional[float] = None
         self._finalize_pending: bool = False
         self._finalize_requested: bool = False
+        self._last_transcript_time: float = 0
 
         # Keepalive state
         self._keepalive_timeout = keepalive_timeout
@@ -183,18 +192,53 @@ class STTService(AIService):
     async def set_model(self, model: str):
         """Set the speech recognition model.
 
+        .. deprecated:: 0.0.104
+            Use ``STTUpdateSettingsFrame(model=...)`` instead.
+
         Args:
             model: The name of the model to use for speech recognition.
         """
-        self.set_model_name(model)
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.warn(
+                "'set_model' is deprecated, use 'STTUpdateSettingsFrame(model=...)' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        logger.info(f"Switching STT model to: [{model}]")
+        settings_cls = type(self._settings)
+        await self._update_settings(settings_cls(model=model))
 
     async def set_language(self, language: Language):
         """Set the language for speech recognition.
 
+        .. deprecated:: 0.0.104
+            Use ``STTUpdateSettingsFrame(language=...)`` instead.
+
         Args:
             language: The language to use for speech recognition.
         """
-        pass
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            warnings.warn(
+                "'set_language' is deprecated, use 'STTUpdateSettingsFrame(language=...)' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        logger.info(f"Switching STT language to: [{language}]")
+        settings_cls = type(self._settings)
+        await self._update_settings(settings_cls(language=language))
+
+    def language_to_service_language(self, language: Language) -> Optional[str]:
+        """Convert a language to the service-specific language format.
+
+        Args:
+            language: The language to convert.
+
+        Returns:
+            The service-specific language identifier, or None if not supported.
+        """
+        return Language(language)
 
     @abstractmethod
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
@@ -226,20 +270,29 @@ class STTService(AIService):
         await self._cancel_ttfb_timeout()
         await self._cancel_keepalive_task()
 
-    async def _update_settings(self, settings: Mapping[str, Any]):
-        logger.info(f"Updating STT settings: {self._settings}")
-        for key, value in settings.items():
-            if key in self._settings:
-                logger.info(f"Updating STT setting {key} to: [{value}]")
-                self._settings[key] = value
-                if key == "language":
-                    await self.set_language(value)
-            elif key == "language":
-                await self.set_language(value)
-            elif key == "model":
-                self.set_model_name(value)
-            else:
-                logger.warning(f"Unknown setting for STT service: {key}")
+    async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
+        """Apply an STT settings delta.
+
+        Handles ``model`` (via parent). Translates ``Language`` enum values
+        before applying so the stored value is a service-specific string.
+        Concrete services should override this method and handle language
+        changes (including any reconnect logic) based on the returned
+        changed-field dict.
+
+        Args:
+            delta: An STT settings delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        # Translate language *before* applying so the stored value is canonical
+        if is_given(delta.language) and isinstance(delta.language, Language):
+            converted = self.language_to_service_language(delta.language)
+            if converted is not None:
+                delta.language = converted
+
+        changed = await super()._update_settings(delta)
+        return changed
 
     async def process_audio_frame(self, frame: AudioRawFrame, direction: FrameDirection):
         """Process an audio frame for speech recognition.
@@ -304,7 +357,20 @@ class STTService(AIService):
             await self._handle_vad_user_stopped_speaking(frame)
             await self.push_frame(frame, direction)
         elif isinstance(frame, STTUpdateSettingsFrame):
-            await self._update_settings(frame.settings)
+            if frame.delta is not None:
+                await self._update_settings(frame.delta)
+            elif frame.settings:
+                # Backward-compatible path: convert legacy dict to settings object.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("always")
+                    warnings.warn(
+                        "Passing a dict via STTUpdateSettingsFrame(settings={...}) is deprecated "
+                        "since 0.0.104, use STTUpdateSettingsFrame(delta=STTSettings(...)) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                delta = type(self._settings).from_mapping(frame.settings)
+                await self._update_settings(delta)
         elif isinstance(frame, STTMuteFrame):
             self._muted = frame.mute
             logger.debug(f"STT service {'muted' if frame.mute else 'unmuted'}")
@@ -327,8 +393,8 @@ class STTService(AIService):
             direction: The direction to push the frame.
         """
         if isinstance(frame, TranscriptionFrame):
-            # Store the transcription time for TTFB calculation
-            self._last_transcription_time = time.time()
+            # Store the transcript time for TTFB calculation
+            self._last_transcript_time = time.time()
 
             # Set finalized from pending state and auto-reset
             if self._finalize_pending:
@@ -336,14 +402,10 @@ class STTService(AIService):
                 self._finalize_pending = False
 
             # If this is a finalized transcription, report TTFB immediately
-            if frame.finalized and self._speech_end_time is not None:
-                ttfb = self._last_transcription_time - self._speech_end_time
-                await self._emit_stt_ttfb_metric(ttfb)
+            if frame.finalized:
+                await self.stop_ttfb_metrics()
                 # Cancel the timeout since we've already reported
                 await self._cancel_ttfb_timeout()
-                # Clear state
-                self._speech_end_time = None
-                self._last_transcription_time = None
 
         await super().push_frame(frame, direction)
 
@@ -373,8 +435,6 @@ class STTService(AIService):
         while user is still speaking.
         """
         await self._cancel_ttfb_timeout()
-        self._speech_end_time = None
-        self._last_transcription_time = None
 
     async def _handle_vad_user_started_speaking(self, frame: VADUserStartedSpeakingFrame):
         """Handle VAD user started speaking frame to start tracking transcriptions.
@@ -389,6 +449,7 @@ class STTService(AIService):
         self._user_speaking = True
         self._finalize_requested = False
         self._finalize_pending = False
+        self._last_transcript_time = 0
 
     async def _handle_vad_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         """Handle VAD user stopped speaking frame.
@@ -408,7 +469,8 @@ class STTService(AIService):
         # Calculate the actual speech end time (current time minus VAD stop delay).
         # This approximates when the last user audio was sent to the STT service,
         # which we use to measure against the eventual transcription response.
-        self._speech_end_time = frame.timestamp - frame.stop_secs
+        speech_end_time = frame.timestamp - frame.stop_secs
+        await self.start_ttfb_metrics(start_time=speech_end_time)
 
         # Start timeout task (any previous timeout was cancelled by VADUserStartedSpeakingFrame
         # or InterruptionFrame)
@@ -417,43 +479,22 @@ class STTService(AIService):
         )
 
     async def _ttfb_timeout_handler(self):
-        """Wait for timeout then report TTFB using the last transcription timestamp.
+        """Wait for timeout then report TTFB using the last transcript timestamp.
 
         This timeout allows the final transcription to arrive before we calculate
-        and report TTFB. If no transcription arrived, no TTFB is reported.
+        and report TTFB. Uses _last_transcript_time as the end time so we measure
+        to when the transcript actually arrived, not when the timeout fired.
+        If no transcription arrived, no TTFB is reported.
         """
         try:
             await asyncio.sleep(self._stt_ttfb_timeout)
-
-            # Report TTFB if we have both speech end time and transcription time
-            if self._speech_end_time is not None and self._last_transcription_time is not None:
-                ttfb = self._last_transcription_time - self._speech_end_time
-                await self._emit_stt_ttfb_metric(ttfb)
-
-            # Clear state after reporting
-            self._speech_end_time = None
-            self._last_transcription_time = None
+            if self._last_transcript_time > 0:
+                await self.stop_ttfb_metrics(end_time=self._last_transcript_time)
         except asyncio.CancelledError:
             # Task was cancelled (new utterance or interruption), which is expected behavior
             pass
         finally:
             self._ttfb_timeout_task = None
-
-    async def _emit_stt_ttfb_metric(self, ttfb: float):
-        """Emit STT TTFB metric if value is non-negative.
-
-        Args:
-            ttfb: The TTFB value in seconds.
-        """
-        if ttfb >= 0:
-            logger.debug(f"{self} TTFB: {ttfb:.3f}s")
-            if self.metrics_enabled:
-                ttfb_data = TTFBMetricsData(
-                    processor=self.name,
-                    model=self.model_name,
-                    value=ttfb,
-                )
-                await super().push_frame(MetricsFrame(data=[ttfb_data]))
 
     def _create_keepalive_task(self):
         """Start the keepalive task if keepalive is enabled."""
