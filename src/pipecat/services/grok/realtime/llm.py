@@ -512,7 +512,7 @@ class GrokRealtimeLLMService(LLMService):
                 await self._handle_evt_function_call_arguments_done(evt)
             elif evt.type == "error":
                 if evt.error.code == "response_cancel_not_active":
-                    logger.warning(f"Non-fatal API error: {evt.error.message}")
+                    logger.debug(f"{self} {evt.error.message}")
                 else:
                     await self._handle_evt_error(evt)
                     return
