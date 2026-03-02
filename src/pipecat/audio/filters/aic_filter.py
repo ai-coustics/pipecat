@@ -458,13 +458,16 @@ class AICFilter(BaseAudioFilter):
         if num_blocks == 0:
             return b""
 
-        filtered_chunks: List[bytes] = []
-        mv = memoryview(self._audio_buffer)
         block_size = self._frames_per_block * self._bytes_per_sample
+        total_size = num_blocks * block_size
+        blocks_data = bytes(self._audio_buffer[:total_size])
+        self._audio_buffer = self._audio_buffer[total_size:]
+
+        filtered_chunks: List[bytes] = []
 
         for i in range(num_blocks):
             start = i * block_size
-            block_i16 = np.frombuffer(mv[start : start + block_size], dtype=self._dtype)
+            block_i16 = np.frombuffer(blocks_data[start : start + block_size], dtype=self._dtype)
 
             # Reuse input buffer, in-place divide
             np.copyto(self._in_f32[0], block_i16)
@@ -479,5 +482,4 @@ class AICFilter(BaseAudioFilter):
 
             filtered_chunks.append(self._out_i16.tobytes())
 
-        self._audio_buffer = self._audio_buffer[num_blocks * block_size :]
         return b"".join(filtered_chunks)
