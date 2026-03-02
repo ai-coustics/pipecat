@@ -375,12 +375,7 @@ class AICFilter(BaseAudioFilter):
         self._vad_ctx = self._processor.get_vad_context()
 
         # Apply initial parameters
-        try:
-            self._processor_ctx.set_parameter(
-                ProcessorParameter.Bypass, 1.0 if self._bypass else 0.0
-            )
-        except ParameterFixedError as e:
-            logger.error(f"AIC parameter update failed: {e}")
+        self._processor_ctx.set_parameter(ProcessorParameter.Bypass, 1.0 if self._bypass else 0.0)
 
         # Log processor information
         logger.debug(f"ai-coustics filter started:")
@@ -389,7 +384,8 @@ class AICFilter(BaseAudioFilter):
         logger.debug(f"  Frames per chunk: {self._frames_per_block}")
         logger.debug(f"  Optimal sample rate: {self._model.get_optimal_sample_rate()} Hz")
         logger.debug(
-            f"  Optimal number of frames for {self._sample_rate} Hz: {self._model.get_optimal_num_frames(self._sample_rate)}"
+            f"  Optimal number of frames for {self._sample_rate} Hz: "
+            f"{self._model.get_optimal_num_frames(self._sample_rate)}"
         )
         logger.debug(
             f"  Output delay: {self._processor_ctx.get_output_delay()} samples "
