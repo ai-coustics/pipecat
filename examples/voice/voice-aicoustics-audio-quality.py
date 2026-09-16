@@ -17,6 +17,8 @@ Logging:
       scores. ``risk_score`` (and ``noise`` / ``interfering_speech``) rising
       under poor conditions is the signal that the analyzer is working.
     - DEBUG init lines from AICTytoAnalyzer (run with LOGURU_LEVEL=DEBUG).
+    - INFO policy transitions after sustained degradation or recovery. See
+      README-aic-audio-quality.md for wiring context and VAD adaptation into a bot.
 
 Required env vars:
     AIC_SDK_LICENSE    ai-coustics SDK license key
@@ -34,6 +36,11 @@ from loguru import logger
 from pipecat.metrics.metrics import AICAudioQualityMetricsData
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.audio.aic_audio_quality_policy import (
+    AICAudioQualityPolicy,
+    AICAudioQualityPolicyParams,
+    AICAudioQualityState,
+)
 from pipecat.processors.audio.aic_tyto_analyzer import AICTytoAnalyzer
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -72,7 +79,16 @@ transport_params = {
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
     logger.info("Audio-quality test bot starting")
-    pipeline = Pipeline([transport.input(), aic_tyto_analyzer])
+    policy = AICAudioQualityPolicy(
+        analyzer_name=aic_tyto_analyzer.name,
+        params=AICAudioQualityPolicyParams(update_context=False),
+    )
+
+    @policy.event_handler("on_audio_quality_changed")
+    async def on_audio_quality_changed(_policy, state: AICAudioQualityState):
+        logger.info(f"Audio-quality policy: degraded={state.degraded}, risk={state.risk_score}")
+
+    pipeline = Pipeline([transport.input(), aic_tyto_analyzer, policy])
     worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True))
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
     await runner.add_workers(worker)

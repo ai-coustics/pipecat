@@ -1,1 +1,2 @@
 - Added `AICTytoAnalyzer` for background audio-quality analysis with Tyto risk and dimension scores, result events, RTVI metrics, and optional pre-enhancement collection through `as_input_filter()`. Requires aic-sdk 3.2.
+- Added `AICAudioQualityPolicy` to smooth Tyto risk scores and react to sustained degradation through existing LLM context-transform and optional VAD parameter-update frames, removing the quality note and restoring normal VAD settings on recovery.
